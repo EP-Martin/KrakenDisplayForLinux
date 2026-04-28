@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
+import threading
 import time
 import subprocess
-import psutil
+import os
+import pynvml
+from concurrent.futures import ThreadPoolExecutor
 from PIL import Image, ImageDraw, ImageFont
 
 
@@ -9,16 +12,18 @@ from PIL import Image, ImageDraw, ImageFont
 # CONFIG
 # =========================
 W, H = 320, 320
+PADDING = 20
+SAFE_W = W - (PADDING * 2)
 
-BAR_WIDTH = 318
-BAR_HEIGHT = 25
+BAR_WIDTH = SAFE_W
+BAR_HEIGHT = 22
 BAR_RADIUS = BAR_HEIGHT // 2
-BAR_X = 0
+BAR_X = PADDING
 
-CPU_TEXT_Y = 40
-BAR_CPU_Y  = 120
-BAR_GPU_Y  = 160
-GPU_TEXT_Y = 248
+CPU_TEXT_Y = PADDING + 40
+BAR_CPU_Y  = PADDING + 110
+BAR_GPU_Y  = PADDING + 145
+GPU_TEXT_Y = PADDING + 215
 
 BG_COLOR   = "#000000FF"
 BAR_BG     = "#BEC0C4FF"
@@ -29,19 +34,19 @@ TEXT_MAIN  = "#FFFFFFFF"
 TEXT_SUB   = "#FFFFFFFF"
 
 
-OUTPUT_PNG = "/home/your_username/Documents/liquidctl_new_project/img/logo.png"
+OUTPUT_PNG = "/home/erikm/git/TempBarsGen/img/logo.png"
 LIQUIDCTL_CMD = ['liquidctl', '--match', 'Kraken', 'set', 'lcd', 'screen', 'static', OUTPUT_PNG]
 
 # Interpolazione
-REFRESH_S = 0.5          # ogni quanto aggiorni
+REFRESH_S = 1.0          # ogni quanto aggiorni
 SMOOTHING = 0.35         # 0..1 (più alto = più veloce verso il reale)
 MAX_STEP = 4             # max gradi per step (limita “salti”)
 
 # Font (Gotham SSm)
-FONT_PATH = "/home/your_username/.local/share/fonts/GothamSSm/gothamnarrssm_black.otf"
-font_label = ImageFont.truetype(FONT_PATH, 42)
-font_temp_value = ImageFont.truetype(FONT_PATH, 132)
-font_degree = ImageFont.truetype(FONT_PATH, 38)
+FONT_PATH = "/home/your_username/.local/share/fonts/g/gothamnarrssm_black.otf"
+font_label = ImageFont.truetype(FONT_PATH, 36)
+font_temp_value = ImageFont.truetype(FONT_PATH, 95)
+font_degree = ImageFont.truetype(FONT_PATH, 32)
 
 # =========================
 # FUNZIONI GRAFICHE
@@ -83,37 +88,57 @@ def render_frame(cpu_temp, gpu_temp):
     draw_bar(draw, BAR_X, BAR_CPU_Y, BAR_WIDTH, BAR_HEIGHT, BAR_RADIUS, BAR_BG, CPU_FG, cpu_width)
     draw_bar(draw, BAR_X, BAR_GPU_Y, BAR_WIDTH, BAR_HEIGHT, BAR_RADIUS, BAR_BG, GPU_FG, gpu_width)
 
-    TEMP_RIGHT_EDGE = BAR_X + BAR_WIDTH - 14
+    TEMP_RIGHT_EDGE = W - PADDING - 50
 
     # Temperature (ancorate a destra) + simbolo °
-    draw_temp_with_degree(draw, TEMP_RIGHT_EDGE, CPU_TEXT_Y - 60, cpu_temp,
+    draw_temp_with_degree(draw, TEMP_RIGHT_EDGE, CPU_TEXT_Y - 40, cpu_temp,
                           font_temp_value, font_degree, TEXT_MAIN)
 
-    draw_temp_with_degree(draw, TEMP_RIGHT_EDGE, GPU_TEXT_Y - 80, gpu_temp,
+    draw_temp_with_degree(draw, TEMP_RIGHT_EDGE, GPU_TEXT_Y - 60, gpu_temp,
                           font_temp_value, font_degree, TEXT_MAIN)
 
     # Labels
-    draw.text((BAR_X, CPU_TEXT_Y + 30), "CPU", font=font_label, fill=TEXT_SUB)
-    draw.text((BAR_X, GPU_TEXT_Y - 60), "GPU", font=font_label, fill=TEXT_SUB)
+    draw.text((BAR_X + 10, CPU_TEXT_Y + 15), "CPU", font=font_label, fill=TEXT_SUB)
+    draw.text((BAR_X + 10, GPU_TEXT_Y - 45), "GPU", font=font_label, fill=TEXT_SUB)
 
-    img.save(OUTPUT_PNG)
+    img.convert("RGB").save(OUTPUT_PNG, format="PNG", compress_level=1)
 
 # =========================
 # FUNZIONI TEMPERATURE (INT)
 # =========================
-def get_cpu_temp_int():
-    temps = psutil.sensors_temperatures()
-    if 'k10temp' in temps and temps['k10temp']:
-        return int(round(temps['k10temp'][0].current))
+
+# Initialize NVML once — no per-call driver handshake overhead
+pynvml.nvmlInit()
+_gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+def find_hwmon_by_name(name):
+    base = "/sys/class/hwmon"
+    for entry in os.listdir(base):
+        path = os.path.join(base, entry)
+        try:
+            with open(os.path.join(path, "name")) as f:
+                if f.read().strip() == name:
+                    return path
+        except OSError:
+            pass
     return None
 
+_cpu_hwmon = find_hwmon_by_name("k10temp") # or "coretemp" for Intel
+
+def get_cpu_temp_int():
+    if _cpu_hwmon is None:
+        return None
+    try:
+        with open(os.path.join(_cpu_hwmon, "temp1_input")) as f:
+            return int(f.read().strip()) // 1000
+    except Exception:
+        return None
+
 def get_gpu_temp_int():
-    temps = psutil.sensors_temperatures()
-    if 'amdgpu' in temps:
-        for t in temps['amdgpu']:
-            if t.label == 'edge':
-                return int(round(t.current))
-    return None
+    try:
+        return pynvml.nvmlDeviceGetTemperature(_gpu_handle, pynvml.NVML_TEMPERATURE_GPU)
+    except pynvml.NVMLError:
+        return None
 
 # =========================
 # INTERPOLAZIONE
@@ -168,47 +193,14 @@ def set_lcd_brightness():
         stderr=subprocess.DEVNULL
     )
 
-# import os
-# import sys
+_lcd_lock = threading.Lock()
 
-# def generate_demo_gif():
-#     """
-#     Generates a demo GIF simulating CPU/GPU temperature changes.
-#     Does NOT send anything to the Kraken LCD.
-#     """
-
-#     demo_dir = "img/demo_frames"
-#     os.makedirs(demo_dir, exist_ok=True)
-
-#     frames = []
-
-#     # Simulated temperatures (realistic pattern)
-#     temps = list(range(20, 85, 3)) + list(range(85, 40, -3))
-
-#     for i, t in enumerate(temps):
-#         cpu = t
-#         gpu = max(30, t - 15)
-
-#         # Generate frame (reuse existing renderer)
-#         render_frame(cpu, gpu)
-
-#         frame_path = f"{demo_dir}/frame_{i:03d}.png"
-#         Image.open(OUTPUT_PNG).save(frame_path)
-#         frames.append(Image.open(frame_path))
-
-#     # Create GIF
-#     gif_path = "img/demo.gif"
-#     frames[0].save(
-#         gif_path,
-#         save_all=True,
-#         append_images=frames[1:],
-#         duration=120,   # ms per frame
-#         loop=0
-#     )
-
-#     print(f"Demo GIF created: {gif_path}")
-
-
+def send_to_lcd():
+    with _lcd_lock:
+        try:
+            subprocess.run(LIQUIDCTL_CMD, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
 
 # =========================
 # MAIN LOOP
@@ -224,34 +216,28 @@ def main():
     cpu_disp = None
     gpu_disp = None
 
-    while True:
-        cpu_real = get_cpu_temp_int()
-        gpu_real = get_gpu_temp_int()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        while True:
+            fut_cpu = executor.submit(get_cpu_temp_int)
+            fut_gpu = executor.submit(get_gpu_temp_int)
+            cpu_real = fut_cpu.result()
+            gpu_real = fut_gpu.result()
 
-        cpu_disp = smooth_step(cpu_disp, cpu_real)
-        gpu_disp = smooth_step(gpu_disp, gpu_real)
+            cpu_disp = smooth_step(cpu_disp, cpu_real)
+            gpu_disp = smooth_step(gpu_disp, gpu_real)
 
-        # clamp da 0 a 100 per la barra
-        cpu_show = clamp(cpu_disp if cpu_disp is not None else 0, 0, 100)
-        gpu_show = clamp(gpu_disp if gpu_disp is not None else 0, 0, 100)
+            # clamp da 0 a 100 per la barra
+            cpu_show = clamp(cpu_disp if cpu_disp is not None else 0, 0, 100)
+            gpu_show = clamp(gpu_disp if gpu_disp is not None else 0, 0, 100)
 
-        render_frame(cpu_show, gpu_show)
+            render_frame(cpu_show, gpu_show)
 
-        # invia al Kraken
-        try:
-            subprocess.run(LIQUIDCTL_CMD, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
+            # invia al Kraken
+            t = threading.Thread(target=send_to_lcd, daemon=True)
+            t.start()
 
-        time.sleep(REFRESH_S)
+            time.sleep(REFRESH_S)
 
 
 if __name__ == "__main__":
-
-    # # DEMO MODE (GIF generation)
-    # if len(sys.argv) > 1 and sys.argv[1] == "demo":
-    #     generate_demo_gif()
-    #     sys.exit(0)
-
-    # NORMAL MODE
     main()
